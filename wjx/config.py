@@ -176,6 +176,15 @@ _PROXY_REMOTE_URL_DEFAULT = "https://service.ipzan.com/core-extract?num=1&no=202
 _RANDOM_IP_API_ENV_KEY = "RANDOM_IP_API_URL"
 PROXY_REMOTE_URL = _resolve_env_value(_RANDOM_IP_API_ENV_KEY, _PROXY_REMOTE_URL_DEFAULT)
 
+# ==================== AI API 配置 ====================
+# OpenAI 兼容 API 配置（用于自动生成填空题答案）
+_AI_API_KEY_ENV_KEY = "AI_API_KEY"
+_AI_BASE_URL_ENV_KEY = "AI_BASE_URL"
+_AI_API_KEY_DEFAULT = ""  # 默认留空，必须从环境变量获取
+_AI_BASE_URL_DEFAULT = "https://api.openai.com/v1"  # 可使用兼容接口如 DeepSeek
+AI_API_KEY = _resolve_env_value(_AI_API_KEY_ENV_KEY, _AI_API_KEY_DEFAULT)
+AI_BASE_URL = _resolve_env_value(_AI_BASE_URL_ENV_KEY, _AI_BASE_URL_DEFAULT)
+
 # ==================== 地理位置配置 ====================
 _GAODE_GEOCODE_ENDPOINT = "https://restapi.amap.com/v3/geocode/geo"
 _GAODE_GEOCODE_KEY = "775438cfaa326e71ed2f51d0f6429f79"

@@ -787,6 +787,7 @@ class SurveyGUI(ConfigPersistenceMixin):
         self._qq_group_window: Optional[tk.Toplevel] = None
 
         self._closing = False
+        self._skip_proxy_event = threading.Event()  # 强制跳过代理获取事件
         self._qq_group_photo: Optional[ImageTk.PhotoImage] = None
         self._qq_group_image_path: Optional[str] = None
         self._payment_photo: Optional[ImageTk.PhotoImage] = None
@@ -1073,6 +1074,15 @@ class SurveyGUI(ConfigPersistenceMixin):
         )
         self.preview_button.pack(side=tk.LEFT, padx=5)
 
+        # AI 生成填空答案按钮
+        self.ai_generate_button = ttk.Button(
+            button_row,
+            text="🤖 AI 生成填空答案",
+            command=self._ai_generate_all_fill_questions,
+            state=tk.DISABLED
+        )
+        self.ai_generate_button.pack(side=tk.LEFT, padx=5)
+
         # 执行设置区域（放在配置题目下方）
         step3_frame = ttk.LabelFrame(self.scrollable_content, text="💣 执行设置", padding=10)
         step3_frame.pack(fill=tk.X, padx=10, pady=5)
@@ -1302,12 +1312,29 @@ class SurveyGUI(ConfigPersistenceMixin):
         button_frame.pack(fill=tk.X)
         
         self.start_button = ttk.Button(
-            button_frame, 
-            text="开始执行", 
+            button_frame,
+            text="开始执行",
             command=self.start_run,
             style="Accent.TButton"
         )
         self.start_button.pack(side=tk.LEFT, padx=5)
+
+        # 导入配置按钮
+        ttk.Button(
+            button_frame,
+            text="📂 导入配置",
+            command=self._load_config_from_dialog
+        ).pack(side=tk.LEFT, padx=5)
+
+        # 强制跳过代理按钮（橙色警告样式）
+        self.skip_proxy_button = ttk.Button(
+            button_frame,
+            text="⏭️ 跳过/断开代理",
+            command=self._force_skip_proxy,
+            state=tk.DISABLED
+        )
+        self.skip_proxy_button.pack(side=tk.LEFT, padx=5)
+
         self.stop_button = ttk.Button(button_frame, text="🚫 停止", command=self.stop_run, state=tk.DISABLED)
         self.stop_button.pack(side=tk.LEFT, padx=5)
 
@@ -1971,6 +1998,107 @@ class SurveyGUI(ConfigPersistenceMixin):
 
     def _open_full_simulation_window(self):
         return full_simulation_ui.open_full_simulation_window(self)
+
+    def _ai_generate_all_fill_questions(self):
+        """AI 生成所有填空题的答案（按钮回调）"""
+        if not self.question_entries:
+            self._log_popup_error("错误", "请先解析问卷题目（点击\"自动配置问卷\"）")
+            return
+
+        # 确认操作
+        if not self._log_popup_confirm(
+            "AI 生成填空答案",
+            "将为所有空的填空题/问答题生成 5 个候选答案。\n"
+            "需要联网调用 AI API（约消耗几秒钟/题）。\n\n"
+            "是否继续？"
+        ):
+            return
+
+        # 禁用按钮，防止重复点击
+        self.ai_generate_button.config(state=tk.DISABLED, text="🤖 AI 生成中...")
+        self._safe_preview_button_config(state=tk.DISABLED)
+
+        # 启动后台线程
+        import threading
+        thread = threading.Thread(
+            target=self._ai_generate_worker,
+            daemon=True
+        )
+        thread.start()
+
+        # 监控线程完成
+        self._monitor_ai_thread(thread)
+
+    def _monitor_ai_thread(self, thread):
+        """监控 AI 生成线程，完成后恢复 UI 状态"""
+        if thread.is_alive():
+            self.root.after(500, lambda: self._monitor_ai_thread(thread))
+        else:
+            self.ai_generate_button.config(state=tk.NORMAL, text="🤖 AI 生成填空答案")
+            self._safe_preview_button_config(state=tk.NORMAL)
+            self._refresh_tree()
+
+    def _ai_generate_worker(self):
+        """AI 生成工作线程（后台执行）"""
+        import logging
+        try:
+            from wjx.ai_handler import generate_answers_for_question
+
+            updated_count = 0
+            total_count = 0
+
+            for idx, entry in enumerate(self.question_entries):
+                # 只处理填空题/问答题
+                if entry.question_type not in ("text", "multi_text"):
+                    continue
+
+                # 检查是否已有答案配置
+                if entry.texts and len(entry.texts) > 0:
+                    logging.debug(f"[AI] 第{idx+1}题已有答案配置，跳过")
+                    continue
+
+                total_count += 1
+                question_title = getattr(entry, 'question_num', None) or f"第{idx+1}题"
+
+                try:
+                    # 调用 AI 生成
+                    answers = generate_answers_for_question(question_title)
+
+                    if answers and len(answers) >= 5:
+                        # 更新题目配置
+                        entry.texts = answers
+                        entry.probabilities = [1.0] * len(answers)
+                        entry.option_count = len(answers)
+                        updated_count += 1
+                        logging.info(f"[AI] ✅ 第{idx+1}题已生成 {len(answers)} 个答案")
+                    else:
+                        logging.warning(f"[AI] ⚠️ 第{idx+1}题生成失败或答案不足")
+
+                except Exception as e:
+                    logging.error(f"[AI] ❌ 第{idx+1}题生成异常: {e}")
+
+            # 输出汇总日志
+            if updated_count > 0:
+                logging.info(f"[AI] 🎉 生成完成！已更新 {updated_count} 道题目（共处理 {total_count} 道填空题）")
+                self._log_popup_info(
+                    "AI 生成完成",
+                    f"已为 {updated_count} 道填空题生成答案！\n"
+                    f"共处理 {total_count} 道题目"
+                )
+            else:
+                logging.warning(f"[AI] 未生成任何答案（共检查 {total_count} 道填空题）")
+                self._log_popup_info(
+                    "AI 生成完成",
+                    f"未找到需要生成答案的题目\n"
+                    f"（已有答案或不是填空题）"
+                )
+
+        except ImportError:
+            logging.error("[AI] ai_handler 模块未找到")
+            self._log_popup_error("错误", "AI 模块未找到，请检查安装")
+        except Exception as e:
+            logging.error(f"[AI] 生成过程发生异常: {e}", exc_info=True)
+            self._log_popup_error("错误", f"AI 生成失败：{e}")
 
     def add_question_dialog(self):
         """弹出对话框来添加新的题目配置"""
@@ -2651,6 +2779,12 @@ class SurveyGUI(ConfigPersistenceMixin):
         self._safe_preview_button_config(text=self._get_preview_button_label())
         self._auto_update_full_simulation_times()
 
+        # 启用 AI 生成按钮（如果有题目）
+        if self.question_entries:
+            self.ai_generate_button.config(state=tk.NORMAL)
+        else:
+            self.ai_generate_button.config(state=tk.DISABLED)
+
     def _update_select_all_state(self):
         """根据单个复选框状态更新全选复选框"""
         if not self.question_items:
@@ -2909,10 +3043,86 @@ class SurveyGUI(ConfigPersistenceMixin):
             
             canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
             scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-            
-            add_btn_frame = ttk.Frame(frame)
-            add_btn_frame.pack(fill=tk.X, pady=(5, 0))
-            ttk.Button(add_btn_frame, text="+ 添加答案", command=lambda: add_answer_field()).pack(anchor="w", fill=tk.X)
+
+            # AI 按钮和添加按钮的容器
+            buttons_frame = ttk.Frame(frame)
+            buttons_frame.pack(fill=tk.X, pady=(5, 0))
+
+            # AI 生成按钮
+            ai_button = ttk.Button(
+                buttons_frame,
+                text="✨ AI 自动生成备选",
+                command=lambda: _ai_generate_answers()
+            )
+            ai_button.pack(side=tk.LEFT, padx=(0, 5), fill=tk.X, expand=True)
+
+            # 添加答案按钮
+            ttk.Button(buttons_frame, text="+ 添加答案", command=lambda: add_answer_field()).pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+            # AI 生成函数
+            def _ai_generate_answers():
+                """异步调用 AI 生成答案"""
+                nonlocal answer_vars
+
+                # 禁用按钮，防止重复点击
+                ai_button.config(state=tk.DISABLED, text="✨ AI 生成中...")
+                _set_save_command(None)  # 禁用保存按钮
+
+                # 获取题目标识
+                question_title = str(entry.question_num or f"第{index+1}题")
+
+                def _ai_worker():
+                    """后台工作线程"""
+                    try:
+                        from wjx.ai_handler import generate_answers_for_question
+                        answers = generate_answers_for_question(question_title)
+
+                        if answers and len(answers) >= 5:
+                            # 在主线程中更新UI
+                            self._post_to_ui_thread(lambda: _update_answers_with_ai(answers))
+                            logging.info(f"[AI] 编辑弹窗 - 为题目 '{question_title}' 生成了 {len(answers)} 个答案")
+                        else:
+                            self._post_to_ui_thread(lambda: _ai_failed("AI 生成失败或答案不足"))
+                            logging.warning(f"[AI] 编辑弹窗 - 题目 '{question_title}' 生成失败")
+                    except Exception as e:
+                        self._post_to_ui_thread(lambda: _ai_failed(str(e)))
+                        logging.error(f"[AI] 编辑弹窗 - 题目 '{question_title}' 生成异常: {e}")
+
+                def _update_answers_with_ai(answers):
+                    """更新答案列表（主线程）"""
+                    # 清空现有答案
+                    for var in answer_vars:
+                        # 找到对应的UI组件并销毁
+                        for child in scrollable_frame.winfo_children():
+                            if child.winfo_children():
+                                for widget in child.winfo_children():
+                                    if isinstance(widget, ttk.Entry) and widget.cget('textvariable') == str(var):
+                                        child.destroy()
+                                        break
+
+                    answer_vars.clear()
+
+                    # 添加 AI 生成的答案
+                    for answer in answers:
+                        add_answer_field(answer)
+
+                    # 恢复按钮状态
+                    ai_button.config(state=tk.NORMAL, text="✨ AI 自动生成备选")
+                    _set_save_command(save_text)
+
+                    # 更新 canvas 滚动区域
+                    canvas.configure(scrollregion=canvas.bbox("all"))
+
+                def _ai_failed(error_msg):
+                    """AI 生成失败处理"""
+                    ai_button.config(state=tk.NORMAL, text="✨ AI 自动生成备选")
+                    _set_save_command(save_text)
+                    self._log_popup_error("AI 生成失败", error_msg)
+
+                # 启动后台线程
+                import threading
+                thread = threading.Thread(target=_ai_worker, daemon=True)
+                thread.start()
             
             def save_text():
                 values = [var.get().strip() for var in answer_vars if var.get().strip()]
@@ -4793,7 +5003,8 @@ class SurveyGUI(ConfigPersistenceMixin):
             has_phone_hint = any(keyword in normalized_title for keyword in phone_keywords)
             allow_random_fill = has_name_hint or has_phone_hint
 
-            mode_var = tk.StringVar(value="custom")
+            # AI 自动生成已移除，改为手动按钮触发
+            mode_var = tk.StringVar(value="random")
 
             def add_answer_field(initial_value=""):
                 row_frame = ttk.Frame(answers_inner_frame)
@@ -4845,7 +5056,7 @@ class SurveyGUI(ConfigPersistenceMixin):
 
             ttk.Radiobutton(
                 mode_frame,
-                text="每次随机填入" if allow_random_fill else f"填入“{DEFAULT_FILL_TEXT}”",
+                text="每次随机填入" if allow_random_fill else f"填入\"{DEFAULT_FILL_TEXT}\"",
                 variable=mode_var,
                 value="random",
                 command=ensure_custom_frame_visibility,
@@ -4859,10 +5070,95 @@ class SurveyGUI(ConfigPersistenceMixin):
                 command=ensure_custom_frame_visibility,
             ).pack(side=tk.LEFT)
 
+            # ========== AI 按钮区域（配置向导） ==========
+            ai_button_frame = ttk.Frame(config_frame)
+            ai_button_frame.pack(fill=tk.X, pady=(0, 8))
+
+            # 创建 AI 按钮（非位置题才显示）
+            if not is_location_question:
+                ai_wizard_button = ttk.Button(
+                    ai_button_frame,
+                    text="✨ AI 智能生成备选答案",
+                    command=lambda: _ai_generate_in_wizard()
+                )
+                ai_wizard_button.pack(side=tk.LEFT, padx=(0, 5))
+
+                # AI 生成函数（配置向导专用）
+                def _ai_generate_in_wizard():
+                    """在配置向导中调用 AI 生成答案"""
+                    nonlocal answer_vars, mode_var
+
+                    # 切换到自定义模式以显示答案
+                    mode_var.set("custom")
+                    ensure_custom_frame_visibility()
+
+                    # 禁用按钮
+                    ai_wizard_button.config(state=tk.DISABLED, text="✨ AI 生成中...")
+
+                    # 获取题目标题
+                    question_title = str(q.get("title") or f"第{current_index+1}题").strip()
+
+                    def _ai_worker():
+                        """后台工作线程"""
+                        try:
+                            from wjx.ai_handler import generate_answers_for_question
+                            answers = generate_answers_for_question(question_title)
+
+                            if answers and len(answers) >= 5:
+                                # 在主线程更新UI
+                                self._post_to_ui_thread(lambda: _update_wizard_answers(answers))
+                                logging.info(f"[AI] 配置向导 - 题目 '{question_title}' 生成了 {len(answers)} 个答案")
+                            else:
+                                self._post_to_ui_thread(lambda: _ai_failed_wizard("AI 生成失败或答案不足"))
+                                logging.warning(f"[AI] 配置向导 - 题目 '{question_title}' 生成失败")
+                        except Exception as e:
+                            self._post_to_ui_thread(lambda: _ai_failed_wizard(str(e)))
+                            logging.error(f"[AI] 配置向导 - 题目 '{question_title}' 生成异常: {e}")
+
+                    def _update_wizard_answers(answers):
+                        """更新答案列表（主线程）"""
+                        nonlocal answer_vars
+
+                        # 清空现有答案（保留第一个空的）
+                        for var in answer_vars[1:]:
+                            # 找到对应的UI组件并销毁
+                            for child in answers_inner_frame.winfo_children():
+                                if child.winfo_children():
+                                    for widget in child.winfo_children():
+                                        if isinstance(widget, ttk.Entry) and widget.cget('textvariable') == str(var):
+                                            child.destroy()
+                                            break
+
+                        # 清空列表并保留第一个
+                        first_var = answer_vars[0] if answer_vars else None
+                        answer_vars.clear()
+                        if first_var:
+                            answer_vars.append(first_var)
+
+                        # 更新第一个答案的值
+                        if answers:
+                            first_var.set(answers[0])
+
+                        # 添加剩余的答案
+                        for answer in answers[1:]:
+                            add_answer_field(answer)
+
+                        # 恢复按钮状态
+                        ai_wizard_button.config(state=tk.NORMAL, text="✨ AI 智能生成备选答案")
+
+                    def _ai_failed_wizard(error_msg):
+                        """AI 生成失败处理"""
+                        ai_wizard_button.config(state=tk.NORMAL, text="✨ AI 智能生成备选答案")
+                        self._log_popup_error("AI 生成失败", error_msg)
+
+                    # 启动后台线程
+                    import threading
+                    thread = threading.Thread(target=_ai_worker, daemon=True)
+                    thread.start()
+
             answers_inner_frame = ttk.Frame(config_frame)
             add_btn_frame = ttk.Frame(config_frame)
             add_answer_field("")
-
             ttk.Button(add_btn_frame, text="+ 添加答案", command=lambda: add_answer_field()).pack(anchor="w")
 
             if is_location_question:
@@ -5277,6 +5573,43 @@ class SurveyGUI(ConfigPersistenceMixin):
         self._show_wizard_for_question(questions_info, prev_index)
 
     def start_run(self):
+        # ========== 强制重置所有状态标志（解决第二次运行卡死问题） ==========
+        logging.info("=" * 50)
+        logging.info("--- 开始新任务 - 强制重置所有状态 ---")
+
+        # 重置全局变量（关键！）
+        global cur_num, cur_fail
+        cur_num = 0
+        cur_fail = 0
+
+        # 重置跳过代理事件
+        self._skip_proxy_event.clear()
+
+        # 重置运行状态
+        self.running = False  # 会在启动时重新设为 True
+        self.stop_requested_by_user = False
+        self.stop_request_ts = None
+        self._force_stop_now = False
+
+        # 重置进度
+        self.progress_value = 0
+        self.current_submissions = 0
+        self.progress_bar['value'] = 0
+        self.progress_label.config(text="0%")
+
+        # 重置浏览器跟踪
+        self.active_drivers.clear()
+        self._launched_browser_pids.clear()
+
+        # 清空线程列表（确保上一次的线程不会影响）
+        self.worker_threads = []
+        self.runner_thread = None
+
+        # 打印分隔线
+        logging.info("=" * 50)
+        logging.info(f"[DEBUG] cur_num已重置为 0，cur_fail已重置为 0")
+
+        # ========== 原有的参数验证逻辑 ==========
         url_value = self.url_var.get().strip()
         if not url_value:
             self._log_popup_error("参数错误", "请填写问卷链接")
@@ -5438,6 +5771,11 @@ class SurveyGUI(ConfigPersistenceMixin):
             "random_proxy_api": effective_proxy_api,
         }
         if random_proxy_flag:
+            # 重置跳过代理事件
+            self._skip_proxy_event.clear()
+            # 启用跳过代理按钮
+            self.skip_proxy_button.config(state=tk.NORMAL, text="⏭️ 跳过/断开代理")
+
             self.start_button.config(state=tk.DISABLED)
             self.stop_button.config(state=tk.DISABLED)
             self.status_var.set("正在获取代理...")
@@ -5446,8 +5784,20 @@ class SurveyGUI(ConfigPersistenceMixin):
         self._finish_start_run(ctx, proxy_pool=[])
 
     def _load_proxies_and_start(self, ctx: Dict[str, Any]):
-        if getattr(self, "_closing", False):
+        import threading
+
+        # 创建停止事件
+        stop_event = threading.Event()
+
+        def check_closing():
+            if getattr(self, "_closing", False):
+                stop_event.set()
+                return True
+            return False
+
+        if check_closing():
             return
+
         try:
             try:
                 need_count = int(ctx.get("threads_count") or 1)
@@ -5455,12 +5805,27 @@ class SurveyGUI(ConfigPersistenceMixin):
                 need_count = 1
             need_count = max(1, need_count)
             proxy_api = ctx.get("random_proxy_api")
-            proxy_pool = _fetch_new_proxy_batch(expected_count=need_count, proxy_url=proxy_api)
+
+            # 传递停止信号和跳过代理信号
+            proxy_pool = _fetch_new_proxy_batch(
+                expected_count=need_count,
+                proxy_url=proxy_api,
+                stop_signal=stop_event,
+                skip_proxy_event=self._skip_proxy_event
+            )
         except (OSError, ValueError, RuntimeError) as exc:
-            self._post_to_ui_thread(lambda: self._on_proxy_load_failed(str(exc)))
+            if not check_closing():
+                # 检查是否为用户强制跳过
+                error_msg = str(exc)
+                if "SKIP_PROXY_USER_INTERRUPT" in error_msg:
+                    error_msg = "已响应用户操作，停止获取代理，任务终止"
+                    logging.warning("[代理] 用户强制跳过，任务已终止")
+                self._post_to_ui_thread(lambda: self._on_proxy_load_failed(error_msg))
             return
-        if getattr(self, "_closing", False):
+
+        if check_closing():
             return
+
         self._post_to_ui_thread(lambda: self._finish_start_run(ctx, proxy_pool))
 
     def _on_proxy_load_failed(self, message: str):
@@ -5468,12 +5833,15 @@ class SurveyGUI(ConfigPersistenceMixin):
             return
         self.start_button.config(state=tk.NORMAL)
         self.stop_button.config(state=tk.DISABLED, text="🚫 停止")
+        self.skip_proxy_button.config(state=tk.DISABLED, text="⏭️ 跳过/断开代理")
         self.status_var.set("准备就绪")
         self._log_popup_error("代理IP错误", message)
 
     def _finish_start_run(self, ctx: Dict[str, Any], proxy_pool: List[str]):
         if getattr(self, "_closing", False):
             return
+        # 禁用跳过代理按钮（代理获取已完成）
+        self.skip_proxy_button.config(state=tk.DISABLED, text="⏭️ 跳过/断开代理")
         # 启动前重置已记录的浏览器 PID，避免上一轮遗留
         self._launched_browser_pids.clear()
         if not self._log_refresh_job:
@@ -5527,6 +5895,8 @@ class SurveyGUI(ConfigPersistenceMixin):
         target_num = target
         # 强制限制线程数不超过12，确保用户电脑流畅
         num_threads = min(threads_count, MAX_THREADS)
+        # 存储为实例变量，确保 _launch_threads 能访问到正确的值
+        self._run_num_threads = num_threads
         submit_interval_range_seconds = (interval_total_seconds, max_interval_total_seconds)
         answer_duration_range_seconds = (answer_min_seconds, answer_max_seconds)
         full_simulation_enabled = full_sim_enabled
@@ -5586,6 +5956,8 @@ class SurveyGUI(ConfigPersistenceMixin):
             logging.info(f"[Action Log] 定时模式启用，刷新间隔 {timed_mode_refresh_interval:.2f} 秒，将等待开放后自动提交。")
         fail_threshold = max(1, math.ceil(target_num / 4) + 1)
         stop_event = threading.Event()
+        # 存储为实例变量，确保 _launch_threads 能访问到正确的 stop_event
+        self._run_stop_event = stop_event
         _aliyun_captcha_stop_triggered = False
         _target_reached_stop_triggered = False
         self._force_stop_now = False
@@ -5636,6 +6008,10 @@ class SurveyGUI(ConfigPersistenceMixin):
         self._schedule_status_update()
 
     def _launch_threads(self):
+        # 使用实例变量，确保使用本次运行正确的 stop_event 和 num_threads
+        num_threads = self._run_num_threads
+        stop_event = self._run_stop_event
+
         print(f"正在启动 {num_threads} 个浏览器窗口...")
         launch_gap = 0.0 if _is_fast_mode() else 0.1
         threads: List[Thread] = []
@@ -5692,24 +6068,50 @@ class SurveyGUI(ConfigPersistenceMixin):
             self.status_job = self.root.after(500, self._schedule_status_update)
 
     def _on_run_finished(self):
+        """任务完成后的回调 - 确保完整的状态复位"""
+        logging.info("=" * 50)
+        logging.info("--- 任务完成 - 开始状态复位 ---")
+
+        # 重置运行状态
         self.running = False
+
+        # 重置停止标志（使用实例变量）
+        if hasattr(self, '_run_stop_event') and self._run_stop_event:
+            self._run_stop_event.clear()
+
+        # 重置跳过代理标志
+        self._skip_proxy_event.clear()
+
+        # 清空线程列表
+        self.worker_threads = []
+        self.runner_thread = None
+
+        # 清空浏览器驱动列表
+        self.active_drivers.clear()
+        self._launched_browser_pids.clear()
+
+        # 恢复按钮状态
         self.start_button.config(state=tk.NORMAL)
-        self.stop_button.config(state=tk.DISABLED, text="停止")
+        self.stop_button.config(state=tk.DISABLED, text="🚫 停止")
+        self.skip_proxy_button.config(state=tk.DISABLED, text="⏭️ 跳过/断开代理")
+
+        # 清理状态更新任务
         if self.status_job:
             self.root.after_cancel(self.status_job)
             self.status_job = None
+
+        # 更新最终状态显示
         current = engine.cur_num
         target = engine.target_num
         failures = engine.cur_fail
         if current >= target:
             msg = "任务完成"
-        elif stop_event.is_set():
+        elif hasattr(self, '_run_stop_event') and self._run_stop_event.is_set():
             msg = "已停止"
         else:
             msg = "已结束"
         self.status_var.set(f"{msg} | 已提交 {current}/{target} 份 | 失败 {failures} 次")
-        self.worker_threads = []
-        
+
         # 最终更新进度条
         if current >= target:
             self.progress_bar['value'] = 100
@@ -5719,6 +6121,9 @@ class SurveyGUI(ConfigPersistenceMixin):
                 progress = int((current / target) * 100)
                 self.progress_bar['value'] = progress
                 self.progress_label.config(text=f"{progress}%")
+
+        logging.info("--- 状态复位完成，可开始新任务 ---")
+        logging.info("=" * 50)
 
     def _start_stop_cleanup_with_grace(
         self,
@@ -5831,7 +6236,9 @@ class SurveyGUI(ConfigPersistenceMixin):
         self._force_stop_now = True
         self.stop_requested_by_user = True
         self.stop_request_ts = time.time()
-        stop_event.set()
+        # 使用实例变量，如果存在的话
+        if hasattr(self, '_run_stop_event') and self._run_stop_event:
+            self._run_stop_event.set()
         self.running = False
         try:
             self.stop_button.config(state=tk.DISABLED, text="停止")
@@ -5887,6 +6294,13 @@ class SurveyGUI(ConfigPersistenceMixin):
                 ).start(),
             )
 
+    def _force_skip_proxy(self):
+        """强制跳过代理获取"""
+        logging.warning("⏭️ 用户点击强制跳过，正在中断代理获取...")
+        self._skip_proxy_event.set()
+        self.skip_proxy_button.config(state=tk.DISABLED, text="⏭️ 跳过中...")
+        self.status_var.set("正在中断代理获取...")
+
     def stop_run(self):
         # 允许从后台线程触发：把 UI 操作切回主线程，避免 Tk 在多线程下卡死/异常卡顿
         if threading.current_thread() is not threading.main_thread():
@@ -5899,7 +6313,9 @@ class SurveyGUI(ConfigPersistenceMixin):
             return
         self.stop_requested_by_user = True
         self.stop_request_ts = time.time()
-        stop_event.set()
+        # 使用实例变量，如果存在的话
+        if hasattr(self, '_run_stop_event') and self._run_stop_event:
+            self._run_stop_event.set()
         self.running = False
         self.stop_button.config(state=tk.DISABLED, text="停止中...")
         self.status_var.set("已发送停止请求，正在清理浏览器进程...")

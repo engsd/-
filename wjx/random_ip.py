@@ -218,15 +218,38 @@ def _parse_proxy_line(line: str) -> Optional[str]:
     return f"{host}:{port}"
 
 
-def _load_proxy_ip_pool(proxy_url: Optional[str] = None) -> List[str]:
+def _load_proxy_ip_pool(
+    proxy_url: Optional[str] = None,
+    stop_signal: Optional[threading.Event] = None,
+    skip_proxy_event: Optional[threading.Event] = None
+) -> List[str]:
     if requests is None:
         raise RuntimeError("requests 模块不可用，无法从远程获取代理列表")
     target_url = (proxy_url or "").strip() or get_effective_proxy_api_url()
     _validate_proxy_api_url(target_url)
+
+    # 检查停止信号
+    if stop_signal and stop_signal.is_set():
+        logging.warning("[代理] 检测到停止信号，取消代理获取")
+        raise OSError("用户已取消代理获取")
+
+    # 检查跳过代理信号
+    if skip_proxy_event and skip_proxy_event.is_set():
+        logging.warning("[代理] ⏭️ 用户强制跳过代理获取")
+        raise OSError("SKIP_PROXY_USER_INTERRUPT")  # 特殊标识：用户强制中断
+
     try:
-        response = requests.get(target_url, headers=DEFAULT_HTTP_HEADERS, timeout=12)
+        # 强制 2 秒超时，快速响应
+        response = requests.get(target_url, headers=DEFAULT_HTTP_HEADERS, timeout=2)
         response.raise_for_status()
+    except requests.exceptions.Timeout:
+        logging.error("[代理] 获取代理超时（2秒），网络响应过慢")
+        raise OSError("获取代理超时（2秒），请检查网络或关闭随机IP功能")
+    except requests.exceptions.ConnectionError as e:
+        logging.error(f"[代理] 网络连接失败：{e}")
+        raise OSError(f"网络连接失败，请检查网络：{e}")
     except Exception as exc:
+        logging.error(f"[代理] 获取远程代理列表失败：{exc}")
         raise OSError(f"获取远程代理列表失败：{exc}") from exc
 
     try:
@@ -298,24 +321,65 @@ def _load_proxy_ip_pool(proxy_url: Optional[str] = None) -> List[str]:
     return proxies
 
 
-def _fetch_new_proxy_batch(expected_count: int = 1, proxy_url: Optional[str] = None) -> List[str]:
+def _fetch_new_proxy_batch(
+    expected_count: int = 1,
+    proxy_url: Optional[str] = None,
+    stop_signal: Optional[threading.Event] = None,
+    skip_proxy_event: Optional[threading.Event] = None
+) -> List[str]:
     try:
         expected = int(expected_count)
     except Exception:
         expected = 1
     expected = max(1, expected)
     proxies: List[str] = []
-    # 多尝试几次，尽量拿到足够数量的 IP
-    attempts = max(2, expected)
-    for _ in range(attempts):
-        batch = _load_proxy_ip_pool(proxy_url)
-        for proxy in batch:
-            if proxy not in proxies:
-                proxies.append(proxy)
-                if len(proxies) >= expected:
-                    break
+
+    # 强制重试计数器：最多3次
+    max_retries = 3
+    for i in range(max_retries):
+        # 检查停止信号
+        if stop_signal and stop_signal.is_set():
+            logging.warning("[代理] 检测到停止信号，中断代理获取")
+            break
+
+        # 检查跳过代理信号
+        if skip_proxy_event and skip_proxy_event.is_set():
+            logging.warning("[代理] ⏭️ 用户强制跳过，中断代理获取")
+            break
+
+        try:
+            batch = _load_proxy_ip_pool(proxy_url, stop_signal=stop_signal, skip_proxy_event=skip_proxy_event)
+            for proxy in batch:
+                if proxy not in proxies:
+                    proxies.append(proxy)
+                    if len(proxies) >= expected:
+                        break
+        except OSError as e:
+            # 超时或连接失败
+            if i < max_retries - 1:
+                logging.warning(f"[代理] 第{i+1}次获取代理失败：{e}，还有 {max_retries - i - 1} 次重试机会")
+            else:
+                # 最后一次也失败了
+                logging.error(f"[代理] 第{i+1}次获取代理失败，已达最大重试次数({max_retries})，终止获取")
+                raise OSError(f"代理池耗尽或接口失效（已重试{max_retries}次）：{e}")
+
         if len(proxies) >= expected:
             break
+
+        # 再次检查停止信号
+        if stop_signal and stop_signal.is_set():
+            logging.warning("[代理] 检测到停止信号，中断代理获取")
+            break
+
+        # 再次检查跳过代理信号
+        if skip_proxy_event and skip_proxy_event.is_set():
+            logging.warning("[代理] ⏭️ 用户强制跳过，中断代理获取")
+            break
+
+    # 如果重试后仍然没有拿到足够的代理
+    if not proxies:
+        raise OSError("代理池耗尽或接口失效，无法获取任何有效代理IP")
+
     return proxies
 
 
